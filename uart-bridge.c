@@ -11,11 +11,20 @@
 #include <string.h>
 #include <tusb.h>
 
+#include <hardware/pwm.h>
+
+#include "pico/cyw43_arch.h"
+
+#include "lwip/pbuf.h"
+#include "lwip/udp.h"
+
+#include "secrets.h"
+
 #if !defined(MIN)
 #define MIN(a, b) ((a > b) ? b : a)
 #endif /* MIN */
 
-#define LED_PIN 25
+//#define LED_PIN 25
 
 #define BUFFER_SIZE 2560
 
@@ -42,6 +51,9 @@ typedef struct {
 	uint8_t usb_buffer[BUFFER_SIZE];
 	uint32_t usb_pos;
 	mutex_t usb_mtx;
+
+	uint8_t udp_buffer[BUFFER_SIZE];
+	uint32_t udp_pos;
 } uart_data_t;
 
 void uart0_irq_fn(void);
@@ -52,8 +64,8 @@ const uart_id_t UART_ID[CFG_TUD_CDC] = {
 		.inst = uart0,
 		.irq = UART0_IRQ,
 		.irq_fn = &uart0_irq_fn,
-		.tx_pin = 16,
-		.rx_pin = 17,
+		.tx_pin = 0,
+		.rx_pin = 1,
 	}, {
 		.inst = uart1,
 		.irq = UART1_IRQ,
@@ -197,7 +209,45 @@ void core1_entry(void)
 			}
 		}
 
-		gpio_put(LED_PIN, con);
+		//gpio_put(LED_PIN, con);
+	}
+}
+
+#define UDP_PORT 8887
+#define TARGET_ADDR "10.96.172.28"
+static struct udp_pcb* pcb;
+static ip_addr_t addr;
+
+static struct pbuf* pbuf_to_send = NULL;
+static struct pbuf* next_pbuf_to_send = NULL;
+
+static void my_udp_init()
+{
+	pcb = udp_new();
+	ipaddr_aton(TARGET_ADDR, &addr);
+}
+
+static void add_udp_char(uart_data_t *ud, uint8_t c)
+{
+	if (c == '\n' || ud->udp_pos == 1024) {
+		if (ud->udp_pos) {
+			if ((!strncmp("Temp", ud->udp_buffer, 4) || !strncmp("CoreMark", ud->udp_buffer, 8)))
+			{
+				struct pbuf** ppbuf;
+				if (!pbuf_to_send) ppbuf = &pbuf_to_send;
+				else ppbuf = &next_pbuf_to_send;
+			    if (!*ppbuf) {
+					*ppbuf = pbuf_alloc(PBUF_TRANSPORT, ud->udp_pos+1, PBUF_RAM);
+					memcpy((*ppbuf)->payload, ud->udp_buffer, ud->udp_pos);
+					((uint8_t*)(*ppbuf)->payload)[ud->udp_pos] = 0;
+				}
+			}
+
+			ud->udp_pos = 0;
+		}
+	}
+	else {
+		ud->udp_buffer[ud->udp_pos++] = c;
 	}
 }
 
@@ -211,7 +261,9 @@ static inline void uart_read_bytes(uint8_t itf)
 
 		while (uart_is_readable(ui->inst) &&
 		       (ud->uart_pos < BUFFER_SIZE)) {
-			ud->uart_buffer[ud->uart_pos] = uart_getc(ui->inst);
+			uint8_t c = uart_getc(ui->inst);
+			ud->uart_buffer[ud->uart_pos] = c;
+			add_udp_char(ud, c);
 			ud->uart_pos++;
 		}
 
@@ -277,6 +329,7 @@ void init_uart_data(uint8_t itf)
 	/* Buffer */
 	ud->uart_pos = 0;
 	ud->usb_pos = 0;
+	ud->udp_pos = 0;
 
 	/* Mutex */
 	mutex_init(&ud->lc_mtx);
@@ -306,16 +359,63 @@ int main(void)
 	for (itf = 0; itf < CFG_TUD_CDC; itf++)
 		init_uart_data(itf);
 
-	gpio_init(LED_PIN);
-	gpio_set_dir(LED_PIN, GPIO_OUT);
+	//gpio_init(LED_PIN);
+	//gpio_set_dir(LED_PIN, GPIO_OUT);
 
 	multicore_launch_core1(core1_entry);
+
+#if 1
+	if (cyw43_arch_init_with_country(CYW43_COUNTRY_UK)) {
+        //printf("failed to initialise\n");
+        return 1;
+    }
+
+    cyw43_arch_enable_sta_mode();
+
+    //printf("Connecting to Wi-Fi...\n");
+    //if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 30000)) {
+	if (cyw43_arch_wifi_connect_timeout_ms(WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_OPEN, 30000)) {
+        //printf("failed to connect.\n");
+		cyw43_arch_gpio_put(0, 1);
+		sleep_ms(500);
+		cyw43_arch_gpio_put(0, 0);
+        //return 1;
+    } else {
+        //printf("Connected.\n");
+		cyw43_arch_gpio_put(0, 1);
+    }
+
+	my_udp_init();
+#endif
+
+	gpio_set_function(2, GPIO_FUNC_PWM);
+	uint slice_num = pwm_gpio_to_slice_num(2);
+
+	// Set period of 125 cycles (0 to 124 inclusive)
+    pwm_set_wrap(slice_num, 124);
+    // Set channel A output high for 62 cycles before dropping
+    pwm_set_chan_level(slice_num, PWM_CHAN_A, 62);
+    // Set the PWM running
+    pwm_set_enabled(slice_num, true);
+
+	absolute_time_t next_send_time = get_absolute_time();
 
 	while (1) {
 		for (itf = 0; itf < CFG_TUD_CDC; itf++) {
 			update_uart_cfg(itf);
 			uart_write_bytes(itf);
 		}
+
+		if (pbuf_to_send && absolute_time_diff_us(get_absolute_time(), next_send_time) < 0) {
+			err_t er = udp_sendto(pcb, pbuf_to_send, &addr, UDP_PORT);
+			pbuf_free(pbuf_to_send);
+			pbuf_to_send = next_pbuf_to_send;
+			next_pbuf_to_send = NULL;
+
+			next_send_time = delayed_by_ms(get_absolute_time(), 500);
+		}
+
+        cyw43_arch_poll();
 	}
 
 	return 0;

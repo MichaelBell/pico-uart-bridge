@@ -2,9 +2,11 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-include(pico-sdk/pico_sdk_init.cmake)
+set(PICO_BOARD pico_w)
 
-project(pico_uart_bridge)
+include(pico_sdk_import.cmake)
+
+project(pico_uart_bridge C CXX ASM)
 
 pico_sdk_init()
 
@@ -16,8 +18,10 @@ target_include_directories(uart_bridge PUBLIC
 
 target_link_libraries(uart_bridge
 	hardware_flash
+	hardware_pwm
 	pico_multicore
 	pico_stdlib
-	tinyusb_device)
+	tinyusb_device
+	pico_cyw43_arch_lwip_poll)
 
 pico_add_extra_outputs(uart_bridge)
