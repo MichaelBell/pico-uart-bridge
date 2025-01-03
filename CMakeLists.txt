@@ -2,9 +2,9 @@
 
 cmake_minimum_required(VERSION 3.13)
 
-include(pico-sdk/pico_sdk_init.cmake)
+include(pico_sdk_import.cmake)
 
-project(pico_uart_bridge)
+project(pico_uart_bridge C CXX ASM)
 
 pico_sdk_init()
 
